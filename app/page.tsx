@@ -1,7 +1,8 @@
 "use client";
 
 import { useState, useRef, useEffect } from "react";
-import { Menu, Settings2, X, Send, Plus, Mic } from "lucide-react";
+import axios from "axios";
+import { Menu, Settings2, X, Send, Plus, Mic, Trash2 } from "lucide-react";
 import {
   Select,
   SelectTrigger,
@@ -9,16 +10,45 @@ import {
   SelectContent,
   SelectItem,
 } from "@/components/ui/select";
+import {
+  LineChart,
+  Line,
+  XAxis,
+  YAxis,
+  Tooltip,
+  ResponsiveContainer,
+  CartesianGrid,
+} from "recharts";
+import ReactMarkdown from "react-markdown";
+import remarkGfm from "remark-gfm";
+
+type Message = {
+  sender: string;
+  text: string;
+  type?: "text" | "chart" | "error";
+  chartData?: any[];
+  timestamp: string;
+};
+
+// Função de debounce para evitar múltiplos envios rápidos
+const debounce = (func: (...args: any[]) => void, wait: number) => {
+  let timeout: NodeJS.Timeout;
+  return (...args: any[]) => {
+    clearTimeout(timeout);
+    timeout = setTimeout(() => func(...args), wait);
+  };
+};
 
 export default function Home() {
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const [inputValue, setInputValue] = useState("");
-  const [messages, setMessages] = useState<{ sender: string; text: string }[]>([]);
+  const [messages, setMessages] = useState<Message[]>([]);
   const [availableModels, setAvailableModels] = useState<{
     value: string;
     label: string;
   }[]>([]);
-  const [model, setModel] = useState<string>("deeksek");
+  const [model, setModel] = useState<string>("");
+  const [isLoading, setIsLoading] = useState(false);
   const messagesEndRef = useRef<HTMLDivElement | null>(null);
 
   useEffect(() => {
@@ -30,9 +60,7 @@ export default function Home() {
           setAvailableModels(
             data.models.map((m: any) => ({
               value: m.name,
-              label: m.details?.family
-                ? `${m.details.family} (${m.name})`
-                : m.name,
+              label: m.name,
             }))
           );
           setModel(data.models[0].name);
@@ -43,12 +71,19 @@ export default function Home() {
       } catch {
         setAvailableModels([{ value: "none", label: "Nenhum modelo" }]);
         setModel("none");
+        setMessages((prev) => [
+          ...prev,
+          {
+            sender: "error",
+            text: "Falha ao carregar modelos. Verifique a conexão com o servidor.",
+            timestamp: new Date().toLocaleTimeString(),
+          },
+        ]);
       }
     };
     fetchModels();
   }, []);
 
-  // Padroniza o texto (primeira letra maiúscula e ponto final)
   const standardizeText = (text: string) => {
     if (!text) return "";
     let t = text.trim();
@@ -57,37 +92,139 @@ export default function Home() {
     return t;
   };
 
-  // Envia mensagem para backend Ollama
-  const queryOllama = async (prompt: string) => {
+  const renderChart = (data: any[]) => (
+    <div className="w-full h-64 bg-[#2c2c2c] rounded-xl p-4">
+      <ResponsiveContainer width="100%" height="100%">
+        <LineChart data={data}>
+          <CartesianGrid strokeDasharray="3 3" stroke="#444" />
+          <XAxis
+            dataKey="time"
+            stroke="#ccc"
+            tickFormatter={(tick) =>
+              new Date(tick).toLocaleTimeString([], {
+                hour: "2-digit",
+                minute: "2-digit",
+              })
+            }
+          />
+          <YAxis stroke="#ccc" />
+          <Tooltip
+            contentStyle={{ backgroundColor: "#333", borderColor: "#666" }}
+            labelFormatter={(label) => `Hora: ${new Date(label).toLocaleString()}`}
+          />
+          <Line
+            type="monotone"
+            dataKey="values"
+            stroke="#FF8C00"
+            strokeWidth={2}
+            dot={false}
+            name="Valor"
+          />
+          <Line
+            type="monotone"
+            dataKey={(entry) => (entry.anomaly ? entry.values : null)}
+            stroke="#FF0000"
+            strokeWidth={3}
+            dot={{ r: 5 }}
+            name="Anomalia"
+            isAnimationActive={false}
+            connectNulls={false}
+          />
+        </LineChart>
+      </ResponsiveContainer>
+    </div>
+  );
+
+  const queryMatrixProfile = async (metric: string) => {
+    console.log("metric:", metric);
+    const data = {
+      prom_query: "prometheus_tsdb_compaction_chunk_range_seconds_sum",
+    };
     try {
-      const res = await fetch("http://127.0.0.1:3003/ollama", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ prompt, model }),
-      });
-      const data = await res.json();
-      return data.response as string;
-    } catch (err) {
-      console.error(err);
-      return "Desculpe, ocorreu um erro.";
+      const response = await axios.post("http://127.0.0.1:3003/matrix-profile", data);
+      console.log("response:", response.data);
+      return response.data; // Retorna o JSON completo
+    } catch (error) {
+      console.error("Error fetching matrix profile:", error);
+      throw new Error(`Erro ao consultar a métrica ${metric} no Prometheus.`);
     }
   };
 
-  const handleSend = async () => {
-    if (!inputValue.trim()) return;
-    const userMessage = standardizeText(inputValue);
-    setMessages((prev) => [...prev, { sender: "user", text: userMessage }]);
-    setInputValue("");
-
-    const assistantRaw = await queryOllama(userMessage);
-    const assistantMessage = standardizeText(assistantRaw);
-    setMessages((prev) => [...prev, { sender: "assistant", text: assistantMessage }]);
+  const queryOllama = async (metric: string, matrixData: any) => {
+    try {
+      const ollamaPrompt = `
+        Você é um analista de observabilidade no projeto NuFuturo. Aqui estão os dados JSON da métrica '${metric}' obtida do Prometheus:
+        \`\`\`json
+        ${JSON.stringify(matrixData, null, 2)}
+        \`\`\`
+        Por favor, gere um resumo, descreva o comportamento da métrica, identifique se há anomalias e forneça uma avaliação geral. Use Markdown para formatar a resposta.
+      `;
+      const res = await fetch("http://127.0.0.1:3003/ollama", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ prompt: ollamaPrompt, model }),
+      });
+      if (!res.ok) throw new Error(`Erro ${res.status}: ${res.statusText}`);
+      return await res.json();
+    } catch (err) {
+      console.error(err);
+      throw new Error("Erro ao processar a solicitação com o Ollama.");
+    }
   };
 
-  // Scroll automático para a última mensagem
+  const handleSend = debounce(async () => {
+    if (!inputValue.trim()) return;
+    const userMessage = standardizeText(inputValue);
+    setMessages((prev) => [
+      ...prev,
+      { sender: "user", text: userMessage, timestamp: new Date().toLocaleTimeString() },
+    ]);
+    setInputValue("");
+    setIsLoading(true);
+
+    try {
+      // Consultar o /matrix-profile/
+      const matrixData = await queryMatrixProfile(userMessage);
+      // Enviar os dados para o Ollama
+      const ollamaResponse = await queryOllama(userMessage, matrixData);
+      const assistantMessage = standardizeText(ollamaResponse.response);
+      setMessages((prev) => [
+        ...prev,
+        {
+          sender: "assistant",
+          text: assistantMessage,
+          type: "text",
+          timestamp: new Date().toLocaleTimeString(),
+        },
+        ...(matrixData.data && Array.isArray(matrixData.data)
+          ? [
+              {
+                sender: "assistant",
+                text: "",
+                type: "chart",
+                chartData: matrixData.data, // Usa o campo 'data' para o gráfico
+                timestamp: new Date().toLocaleTimeString(),
+              },
+            ]
+          : []),
+      ]);
+    } catch (err) {
+      setMessages((prev) => [
+        ...prev,
+        {
+          sender: "error",
+          text: err.message,
+          timestamp: new Date().toLocaleTimeString(),
+        },
+      ]);
+    } finally {
+      setIsLoading(false);
+    }
+  }, 500); // Debounce de 500ms
+
   useEffect(() => {
     if (messagesEndRef.current) {
-      messagesEndRef.current.scrollIntoView({ behavior: 'smooth' });
+      messagesEndRef.current.scrollIntoView({ behavior: "smooth" });
     }
   }, [messages]);
 
@@ -96,11 +233,15 @@ export default function Home() {
   return (
     <>
       <style jsx global>{`
-        .no-scrollbar::-webkit-scrollbar { display: none; }
-        .no-scrollbar { -ms-overflow-style: none; scrollbar-width: none; }
+        .no-scrollbar::-webkit-scrollbar {
+          display: none;
+        }
+        .no-scrollbar {
+          -ms-overflow-style: none;
+          scrollbar-width: none;
+        }
       `}</style>
       <div className="flex h-screen w-screen bg-[#212121] overflow-hidden relative">
-
         {/* Sidebar */}
         <aside
           className={`fixed z-10 top-0 left-0 h-full w-64 bg-[#181818] p-4 transition-transform duration-300 ${
@@ -114,6 +255,13 @@ export default function Home() {
             </button>
           </div>
           <div className="text-white text-2xl font-semibold mb-6">NuFuturo</div>
+          <button
+            onClick={() => setMessages([])}
+            className="flex items-center space-x-2 text-white hover:bg-[#222] p-2 rounded-lg"
+          >
+            <Trash2 size={20} />
+            <span>Limpar Conversa</span>
+          </button>
         </aside>
 
         {/* Avatar and Model Select */}
@@ -138,7 +286,6 @@ export default function Home() {
               ))}
             </SelectContent>
           </Select>
-
           <div className="w-10 h-10 rounded-full bg-[#FF8C00] flex items-center justify-center text-white font-bold">
             MS
           </div>
@@ -146,11 +293,12 @@ export default function Home() {
 
         {/* Main content */}
         <div className="flex flex-1 flex-col md:pl-64 p-4">
-
           {/* Messages or placeholder */}
-          <div className={`flex-1 w-full max-w-3xl mx-auto no-scrollbar overflow-y-auto p-2 ${
-            isEmpty ? 'flex items-center justify-center' : 'flex flex-col'
-          }`}>
+          <div
+            className={`flex-1 w-full max-w-3xl mx-auto no-scrollbar overflow-y-auto p-2 ${
+              isEmpty ? "flex items-center justify-center" : "flex flex-col"
+            }`}
+          >
             {isEmpty ? (
               <h1 className="text-gray-400 text-center text-xl">
                 Como posso ajudar?
@@ -160,14 +308,28 @@ export default function Home() {
                 <div
                   key={idx}
                   className={`p-4 rounded-2xl w-full max-w-3xl mx-auto my-1 text-gray-100 ${
-                    msg.sender === 'user'
-                      ? 'bg-[#303030] self-end text-right'
-                      : 'bg-transparent self-start text-left'
+                    msg.sender === "user"
+                      ? "bg-[#303030] self-end text-right"
+                      : msg.sender === "error"
+                      ? "bg-red-600 self-start text-left"
+                      : msg.type === "chart"
+                      ? "bg-transparent self-start"
+                      : "bg-transparent self-start text-left"
                   }`}
                 >
-                  {msg.text}
+                  <div className="text-sm text-gray-400 mb-1">{msg.timestamp}</div>
+                  {msg.type === "chart" ? (
+                    renderChart(msg.chartData || [])
+                  ) : (
+                    <ReactMarkdown remarkPlugins={[remarkGfm]}>{msg.text}</ReactMarkdown>
+                  )}
                 </div>
               ))
+            )}
+            {isLoading && (
+              <div className="p-4 rounded-2xl w-full max-w-3xl mx-auto my-1 text-gray-100 bg-[#303030] self-end text-right">
+                <div className="animate-pulse">Analisando métrica, aguarde...</div>
+              </div>
             )}
             <div ref={messagesEndRef}></div>
           </div>
@@ -179,11 +341,11 @@ export default function Home() {
                 <Plus size={20} className="text-white" />
               </button>
               <textarea
-                placeholder="Envie uma matriz do Prometheus"
+                placeholder="Envie uma matriz do Prometheus (ex.: prometheus_tsdb_compaction_chunk_range_seconds_sum)"
                 value={inputValue}
                 onChange={(e) => setInputValue(e.target.value)}
                 onKeyDown={(e) => {
-                  if (e.key === 'Enter' && !e.shiftKey) {
+                  if (e.key === "Enter" && !e.shiftKey) {
                     e.preventDefault();
                     handleSend();
                   }
