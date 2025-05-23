@@ -1,5 +1,4 @@
 "use client";
-
 import { useState, useRef, useEffect } from "react";
 import axios from "axios";
 import { Menu, Settings2, X, Send, Plus, Mic, Trash2 } from "lucide-react";
@@ -23,14 +22,15 @@ import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 
 type Message = {
+  id?: number;
   sender: string;
   text: string;
   type?: "text" | "chart" | "error";
   chartData?: any[];
   timestamp: string;
+  isStreaming?: boolean;
 };
 
-// Função de debounce para evitar múltiplos envios rápidos
 const debounce = (func: (...args: any[]) => void, wait: number) => {
   let timeout: NodeJS.Timeout;
   return (...args: any[]) => {
@@ -136,36 +136,58 @@ export default function Home() {
   );
 
   const queryMatrixProfile = async (metric: string) => {
-    console.log("metric:", metric);
     const data = {
-      prom_query: "prometheus_tsdb_compaction_chunk_range_seconds_sum",
+      prom_query: metric,
     };
+
     try {
       const response = await axios.post("http://127.0.0.1:3003/matrix-profile", data);
-      console.log("response:", response.data);
-      return response.data; // Retorna o JSON completo
+
+      alert(JSON.stringify(response.data, null, 2));
+
+      
+      if (response.status !== 200) {
+        alert("Erro ao consultar a métrica no Prometheus.");
+        throw new Error(`Erro ${response.status}: ${response.statusText}`);
+      }
+      return response.data;
     } catch (error) {
       console.error("Error fetching matrix profile:", error);
       throw new Error(`Erro ao consultar a métrica ${metric} no Prometheus.`);
     }
   };
 
-  const queryOllama = async (metric: string, matrixData: any) => {
+  const queryOllama = async (
+    metric: string,
+    matrixData: any,
+    onStream: (chunk: string) => void
+  ) => {
     try {
       const ollamaPrompt = `
-        Você é um analista de observabilidade no projeto NuFuturo. Aqui estão os dados JSON da métrica '${metric}' obtida do Prometheus:
-        \`\`\`json
-        ${JSON.stringify(matrixData, null, 2)}
-        \`\`\`
-        Por favor, gere um resumo, descreva o comportamento da métrica, identifique se há anomalias e forneça uma avaliação geral. Use Markdown para formatar a resposta.
-      `;
+      veja os dados somente dessa metrica:
+      Você é um analista de observabilidade no projeto NuFuturo. Aqui estão os dados JSON da métrica '${metric}' obtida do Prometheus:
+      \`\`\`json
+      ${JSON.stringify(matrixData, null, 2)}
+      \`\`\`
+      Por favor, gere um resumo, descreva o comportamento da métrica, identifique se há anomalias e forneça uma avaliação geral. Use Markdown para formatar a resposta.
+    `;
       const res = await fetch("http://127.0.0.1:3003/ollama", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ prompt: ollamaPrompt, model }),
+        body: JSON.stringify({ prompt: ollamaPrompt, model, stream: true }),
       });
       if (!res.ok) throw new Error(`Erro ${res.status}: ${res.statusText}`);
-      return await res.json();
+      const reader = res.body!.getReader();
+      const decoder = new TextDecoder();
+      let done = false;
+      while (!done) {
+        const { value, done: doneReading } = await reader.read();
+        done = doneReading;
+        if (value) {
+          const chunk = decoder.decode(value, { stream: true });
+          onStream(chunk);
+        }
+      }
     } catch (err) {
       console.error(err);
       throw new Error("Erro ao processar a solicitação com o Ollama.");
@@ -183,31 +205,48 @@ export default function Home() {
     setIsLoading(true);
 
     try {
-      // Consultar o /matrix-profile/
-      const matrixData = await queryMatrixProfile(userMessage);
-      // Enviar os dados para o Ollama
-      const ollamaResponse = await queryOllama(userMessage, matrixData);
-      const assistantMessage = standardizeText(ollamaResponse.response);
+      const matrixData = await queryMatrixProfile(inputValue);
+      const assistantMessageId = Date.now();
       setMessages((prev) => [
         ...prev,
         {
+          id: assistantMessageId,
           sender: "assistant",
-          text: assistantMessage,
+          text: "",
           type: "text",
           timestamp: new Date().toLocaleTimeString(),
+          isStreaming: true,
         },
-        ...(matrixData.data && Array.isArray(matrixData.data)
-          ? [
-              {
-                sender: "assistant",
-                text: "",
-                type: "chart",
-                chartData: matrixData.data, // Usa o campo 'data' para o gráfico
-                timestamp: new Date().toLocaleTimeString(),
-              },
-            ]
-          : []),
       ]);
+
+      const onStream = (chunk: string) => {
+        setMessages((prev) =>
+          prev.map((msg) =>
+            msg.id === assistantMessageId ? { ...msg, text: msg.text + chunk } : msg
+          )
+        );
+      };
+
+      await queryOllama(userMessage, matrixData, onStream);
+
+      setMessages((prev) =>
+        prev.map((msg) =>
+          msg.id === assistantMessageId ? { ...msg, isStreaming: false } : msg
+        )
+      );
+
+      if (matrixData.data && Array.isArray(matrixData.data)) {
+        setMessages((prev) => [
+          ...prev,
+          {
+            sender: "assistant",
+            text: "",
+            type: "chart",
+            chartData: matrixData.data,
+            timestamp: new Date().toLocaleTimeString(),
+          },
+        ]);
+      }
     } catch (err) {
       setMessages((prev) => [
         ...prev,
@@ -220,7 +259,7 @@ export default function Home() {
     } finally {
       setIsLoading(false);
     }
-  }, 500); // Debounce de 500ms
+  }, 500);
 
   useEffect(() => {
     if (messagesEndRef.current) {
@@ -242,11 +281,9 @@ export default function Home() {
         }
       `}</style>
       <div className="flex h-screen w-screen bg-[#212121] overflow-hidden relative">
-        {/* Sidebar */}
         <aside
-          className={`fixed z-10 top-0 left-0 h-full w-64 bg-[#181818] p-4 transition-transform duration-300 ${
-            sidebarOpen ? "translate-x-0" : "-translate-x-full"
-          } md:translate-x-0`}
+          className={`fixed z-10 top-0 left-0 h-full w-64 bg-[#181818] p-4 transition-transform duration-300 ${sidebarOpen ? "translate-x-0" : "-translate-x-full"
+            } md:translate-x-0`}
         >
           <div className="flex items-center justify-between mb-8">
             <Settings2 size={24} className="text-white" />
@@ -264,7 +301,6 @@ export default function Home() {
           </button>
         </aside>
 
-        {/* Avatar and Model Select */}
         <div className="fixed top-4 right-4 z-20 flex items-center space-x-2">
           <Select value={model} onValueChange={setModel}>
             <SelectTrigger className="w-40 md:w-64 bg-[#333333] border border-[#333] text-white focus:ring-2 focus:ring-[#444]">
@@ -291,13 +327,11 @@ export default function Home() {
           </div>
         </div>
 
-        {/* Main content */}
         <div className="flex flex-1 flex-col md:pl-64 p-4">
-          {/* Messages or placeholder */}
+
           <div
-            className={`flex-1 w-full max-w-3xl mx-auto no-scrollbar overflow-y-auto p-2 ${
-              isEmpty ? "flex items-center justify-center" : "flex flex-col"
-            }`}
+            className={`flex-1 w-full max-w-3xl mx-auto no-scrollbar overflow-y-auto p-2 ${isEmpty ? "flex items-center justify-center" : "flex flex-col"
+              }`}
           >
             {isEmpty ? (
               <h1 className="text-gray-400 text-center text-xl">
@@ -307,25 +341,41 @@ export default function Home() {
               messages.map((msg, idx) => (
                 <div
                   key={idx}
-                  className={`p-4 rounded-2xl w-full max-w-3xl mx-auto my-1 text-gray-100 ${
-                    msg.sender === "user"
-                      ? "bg-[#303030] self-end text-right"
-                      : msg.sender === "error"
+                  className={`p-4 rounded-2xl w-full max-w-3xl mx-auto my-1 text-gray-100 ${msg.sender === "user"
+                    ? "bg-[#303030] self-end text-right"
+                    : msg.sender === "error"
                       ? "bg-red-600 self-start text-left"
                       : msg.type === "chart"
-                      ? "bg-transparent self-start"
-                      : "bg-transparent self-start text-left"
-                  }`}
+                        ? "bg-transparent self-start"
+                        : "bg-transparent self-start text-left"
+                    }`}
                 >
                   <div className="text-sm text-gray-400 mb-1">{msg.timestamp}</div>
                   {msg.type === "chart" ? (
                     renderChart(msg.chartData || [])
                   ) : (
-                    <ReactMarkdown remarkPlugins={[remarkGfm]}>{msg.text}</ReactMarkdown>
+                    <>
+                      <div className="break-words text-left">
+                        <ReactMarkdown
+                          remarkPlugins={[remarkGfm]}
+                          components={{
+                            p: ({ node, ...props }) => <p className="block" {...props} />,
+                          }}
+                        >
+                          {msg.text}
+                        </ReactMarkdown>
+                        {msg.isStreaming && <span className="animate-pulse">▋</span>}
+
+                      </div>
+                    </>
                   )}
+
+
                 </div>
               ))
+
             )}
+
             {isLoading && (
               <div className="p-4 rounded-2xl w-full max-w-3xl mx-auto my-1 text-gray-100 bg-[#303030] self-end text-right">
                 <div className="animate-pulse">Analisando métrica, aguarde...</div>
@@ -334,14 +384,13 @@ export default function Home() {
             <div ref={messagesEndRef}></div>
           </div>
 
-          {/* Input Bar */}
           <div className="w-full max-w-3xl mx-auto mt-4">
             <div className="relative flex items-center bg-[#444654] rounded-3xl h-16">
               <button className="absolute left-4 top-1/2 transform -translate-y-1/2">
                 <Plus size={20} className="text-white" />
               </button>
               <textarea
-                placeholder="Envie uma matriz do Prometheus (ex.: prometheus_tsdb_compaction_chunk_range_seconds_sum)"
+                placeholder="Envie uma métrica do Prometheus (ex.: go_info)"
                 value={inputValue}
                 onChange={(e) => setInputValue(e.target.value)}
                 onKeyDown={(e) => {
@@ -364,7 +413,6 @@ export default function Home() {
           </div>
         </div>
 
-        {/* Toggle */}
         <button
           className="fixed top-4 left-4 z-20"
           onClick={() => setSidebarOpen(!sidebarOpen)}
